@@ -201,6 +201,9 @@ choice BOARD_TYPE
     config BOARD_TYPE_LICHUANG_ESP32S3R8N8
         bool "立创·ESP32S3R8N8开发板"
         depends on IDF_TARGET_ESP32S3
+    config BOARD_TYPE_LICHUANG_ESP32S3R8N8_LCD
+        bool "立创·ESP32S3R8N8开发板_LCD"
+        depends on IDF_TARGET_ESP32S3
     config BOARD_TYPE_DF_K10
         bool "DFRobot 行空板 k10"
         depends on IDF_TARGET_ESP32S3
