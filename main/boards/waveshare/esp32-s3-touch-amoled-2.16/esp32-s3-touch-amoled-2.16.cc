@@ -280,8 +280,11 @@ private:
             },
             .flags = {
                 .swap_xy = 0,
-                .mirror_x = 1,
-                .mirror_y = 1,
+                // The panel reports its coordinates rotated by 180 degrees
+                // relative to the LCD, so mirroring both axes put every touch
+                // at the opposite corner and flipped swipe directions.
+                .mirror_x = 0,
+                .mirror_y = 0,
             },
         };
         esp_lcd_panel_io_handle_t tp_io_handle = NULL;
