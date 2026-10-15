@@ -1,5 +1,6 @@
 #include "wifi_board.h"
 #include "display/lcd_display.h"
+#include "lvgl_theme.h"
 #include "esp_lcd_co5300.h"
 
 #include "codecs/box_audio_codec.h"
@@ -22,6 +23,9 @@
 #include <esp_lcd_touch_cst9217.h>
 #include <esp_lvgl_port.h>
 #include <lvgl.h>
+
+#include <functional>
+#include <string>
 
 #define TAG "WaveshareEsp32s3TouchAMOLED2inch16"
 
@@ -112,6 +116,13 @@ public:
         // to ensure lvgl objects are created before accessing them
     }
 
+    // The board installs this so a touch can take the panel out of power save.
+    void SetWakeCallback(std::function<void()> callback) { wake_callback_ = std::move(callback); }
+
+    // The board reports power save transitions. The touch that wakes the panel
+    // must not also be interpreted as a tap or a swipe.
+    void SetAsleep(bool asleep) { asleep_ = asleep; }
+
     virtual void SetupUI() override {
         // Call parent SetupUI() first to create all lvgl objects
         SpiLcdDisplay::SetupUI();
@@ -128,7 +139,277 @@ public:
         // corners too so long strings do not run into the radius.
         lv_obj_set_style_pad_left(status_bar_, DISPLAY_CORNER_INSET, 0);
         lv_obj_set_style_pad_right(status_bar_, DISPLAY_CORNER_INSET, 0);
+
+        // --- touch UI -------------------------------------------------------
+        // The framework ships no interactive widgets, so install our own:
+        // tap = start/stop talking, swipe up = the same, swipe down = settings.
+        lv_obj_t* screen = lv_screen_active();
+        // A swipe has to arrive as a gesture; a scrollable screen eats it.
+        lv_obj_set_scrollbar_mode(screen, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_set_scroll_dir(screen, LV_DIR_NONE);
+
+        // LVGL hands input to the topmost clickable object only, and the chat
+        // area covers the screen, so every layer in between needs wiring up.
+        for (lv_obj_t* obj : {screen, container_, content_}) {
+            if (obj == nullptr) {
+                continue;
+            }
+            lv_obj_add_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(obj, OnPressed, LV_EVENT_PRESSED, this);
+            lv_obj_add_event_cb(obj, OnClicked, LV_EVENT_CLICKED, this);
+            lv_obj_add_event_cb(obj, OnGesture, LV_EVENT_GESTURE, this);
+        }
+
         lv_display_add_event_cb(display_, rounder_event_cb, LV_EVENT_INVALIDATE_AREA, NULL);
+    }
+
+private:
+    std::function<void()> wake_callback_;
+    bool asleep_ = false;
+    bool swallow_input_ = false;
+    bool gesture_seen_ = false;  // a swipe has already been handled for this touch
+    lv_obj_t* setting_box_ = nullptr;
+    lv_obj_t* setting_aec_ = nullptr;
+    lv_obj_t* setting_battery_ = nullptr;
+
+    static CustomLcdDisplay* Self(lv_event_t* e) {
+        return static_cast<CustomLcdDisplay*>(lv_event_get_user_data(e));
+    }
+
+    // A press anywhere brings the panel back from power save.
+    static void OnPressed(lv_event_t* e) {
+        auto* self = Self(e);
+        if (self == nullptr) {
+            return;
+        }
+        self->gesture_seen_ = false;  // a new touch starts here
+        if (self->wake_callback_) {
+            self->wake_callback_();
+        }
+        if (self->asleep_) {
+            // This touch only woke the screen up, so drop the rest of it.
+            self->asleep_ = false;
+            self->swallow_input_ = true;
+        }
+    }
+
+    static void OnClicked(lv_event_t* e) {
+        auto* self = Self(e);
+        if (self == nullptr) {
+            return;
+        }
+        if (self->swallow_input_) {
+            self->swallow_input_ = false;
+            return;
+        }
+        // LVGL reports a click after a swipe as well. Only a real tap should
+        // toggle the chat, otherwise every swipe would toggle it twice.
+        if (self->gesture_seen_) {
+            self->gesture_seen_ = false;
+            return;
+        }
+        if (lv_obj_is_valid(self->setting_box_)) {
+            return;  // taps are ignored while the settings panel is open
+        }
+        Application::GetInstance().ToggleChatState();
+    }
+
+    static void OnGesture(lv_event_t* e) {
+        auto* self = Self(e);
+        if (self == nullptr) {
+            return;
+        }
+        self->gesture_seen_ = true;
+
+        auto dir = lv_indev_get_gesture_dir(lv_indev_active());
+        lv_point_t point = {};
+        lv_indev_get_point(lv_indev_active(), &point);
+
+        if (self->swallow_input_) {
+            self->swallow_input_ = false;
+            return;
+        }
+
+        DisplayLockGuard lock(self);
+        if (lv_obj_is_valid(self->setting_box_)) {
+            // A drag on one of the panel's own controls is reported as a
+            // gesture too, so only a downward swipe closes the panel; any
+            // other direction is left to the widget under the finger.
+            if (dir == LV_DIR_BOTTOM) {
+                self->CloseSettings();
+                return;
+            }
+            lv_area_t box = {};
+            lv_obj_get_coords(self->setting_box_, &box);
+            if (point.x >= box.x1 && point.x <= box.x2 && point.y >= box.y1 &&
+                point.y <= box.y2) {
+                return;
+            }
+            self->CloseSettings();
+            return;
+        }
+        auto& app = Application::GetInstance();
+        if (dir == LV_DIR_TOP) {
+            app.ToggleChatState();
+        } else if (dir == LV_DIR_BOTTOM) {
+            // Open from any state. Requiring idle made this unreachable in
+            // practice, because a tap has usually already started listening.
+            self->OpenSettings();
+        }
+    }
+
+    // ---- settings panel ---------------------------------------------------
+
+    static void OnVolumeChanged(lv_event_t* e) {
+        auto* slider = static_cast<lv_obj_t*>(lv_event_get_target(e));
+        auto volume = static_cast<int>(lv_slider_get_value(slider));
+        Board::GetInstance().GetAudioCodec()->SetOutputVolume(volume);
+    }
+
+    static void OnBrightnessChanged(lv_event_t* e) {
+        auto* slider = static_cast<lv_obj_t*>(lv_event_get_target(e));
+        auto brightness = static_cast<uint8_t>(lv_slider_get_value(slider));
+        auto backlight = Board::GetInstance().GetBacklight();
+        if (backlight != nullptr) {
+            backlight->SetBrightness(brightness);
+        }
+    }
+
+    static void OnAecChanged(lv_event_t* e) {
+        auto* sw = static_cast<lv_obj_t*>(lv_event_get_target(e));
+        auto& app = Application::GetInstance();
+        // Application::SetAecMode() schedules the change on the main task, so it
+        // is safe to call from the LVGL task in any state. Bailing out when not
+        // idle left the switch visually flipped but the mode unchanged.
+        auto mode = lv_obj_has_state(sw, LV_STATE_CHECKED) ? kAecOnDeviceSide : kAecOff;
+        app.SetAecMode(mode);
+        Settings settings("audio", true);
+        settings.SetInt("aec_mode", mode);
+    }
+
+    static lv_obj_t* MakeRow(lv_obj_t* parent) {
+        lv_obj_t* row = lv_obj_create(parent);
+        lv_obj_set_size(row, lv_pct(100), 44);
+        lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_pad_all(row, 0, 0);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        return row;
+    }
+
+    static lv_obj_t* AddSliderRow(lv_obj_t* parent, const char* text, int value, int min_value,
+                                  lv_event_cb_t callback) {
+        lv_obj_t* row = MakeRow(parent);
+
+        lv_obj_t* label = lv_label_create(row);
+        lv_label_set_text(label, text);
+        lv_obj_set_style_text_color(label, lv_color_white(), 0);
+        lv_obj_align(label, LV_ALIGN_LEFT_MID, 0, 0);
+
+        lv_obj_t* slider = lv_slider_create(row);
+        lv_obj_set_size(slider, lv_pct(62), 10);
+        lv_obj_align(slider, LV_ALIGN_RIGHT_MID, 0, 0);
+        lv_slider_set_range(slider, min_value, 100);
+        lv_slider_set_value(slider, value, LV_ANIM_OFF);
+        lv_obj_set_ext_click_area(slider, 16);
+        lv_obj_add_event_cb(slider, callback, LV_EVENT_VALUE_CHANGED, nullptr);
+        return slider;
+    }
+
+    void OpenSettings() {
+        if (lv_obj_is_valid(setting_box_)) {
+            return;
+        }
+        auto theme = static_cast<LvglTheme*>(current_theme_);
+        auto text_font = theme->text_font()->font();
+
+        setting_box_ = lv_obj_create(lv_screen_active());
+        // Kept deliberately smaller than the screen and slightly translucent so
+        // the chat underneath stays readable while the panel is open.
+        lv_obj_set_size(setting_box_, lv_pct(86), lv_pct(62));
+        lv_obj_center(setting_box_);
+        lv_obj_set_style_bg_color(setting_box_, lv_color_hex(0x101014), 0);
+        lv_obj_set_style_bg_opa(setting_box_, LV_OPA_80, 0);
+        lv_obj_set_style_radius(setting_box_, 18, 0);
+        lv_obj_set_style_border_width(setting_box_, 0, 0);
+        lv_obj_set_style_pad_all(setting_box_, 14, 0);
+        lv_obj_set_flex_flow(setting_box_, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(setting_box_, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+        lv_obj_remove_flag(setting_box_, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t* title = lv_label_create(setting_box_);
+        lv_obj_set_style_text_font(title, text_font, 0);
+        lv_obj_set_style_text_color(title, lv_color_white(), 0);
+        lv_label_set_text(title, "设置");
+
+        AddSliderRow(setting_box_, "音量",
+                     Board::GetInstance().GetAudioCodec()->output_volume(), 0, OnVolumeChanged);
+
+        auto backlight = Board::GetInstance().GetBacklight();
+        // The panel has no backlight GPIO: brightness goes straight into the
+        // AMOLED command 0x51, where 0 means a completely dark screen. Keep a
+        // floor so the slider cannot make the device unusable.
+        AddSliderRow(setting_box_, "亮度",
+                     backlight != nullptr ? backlight->brightness() : 50, 5, OnBrightnessChanged);
+
+#if CONFIG_USE_DEVICE_AEC
+        // Voice interruption on/off, i.e. device side AEC. Only offered when
+        // the build actually supports it.
+        lv_obj_t* aec_row = MakeRow(setting_box_);
+        lv_obj_t* aec_label = lv_label_create(aec_row);
+        lv_label_set_text(aec_label, "语音打断");
+        lv_obj_set_style_text_color(aec_label, lv_color_white(), 0);
+        lv_obj_align(aec_label, LV_ALIGN_LEFT_MID, 0, 0);
+
+        setting_aec_ = lv_switch_create(aec_row);
+        lv_obj_set_size(setting_aec_, 50, 25);
+        lv_obj_set_ext_click_area(setting_aec_, 12);
+        lv_obj_align(setting_aec_, LV_ALIGN_RIGHT_MID, 0, 0);
+        if (Application::GetInstance().GetAecMode() != kAecOff) {
+            lv_obj_add_state(setting_aec_, LV_STATE_CHECKED);
+        }
+        lv_obj_add_event_cb(setting_aec_, OnAecChanged, LV_EVENT_VALUE_CHANGED, nullptr);
+#endif
+
+        // Battery level, straight from the AXP2101.
+        setting_battery_ = lv_label_create(setting_box_);
+        lv_obj_set_style_text_font(setting_battery_, text_font, 0);
+        lv_obj_set_style_text_color(setting_battery_, lv_color_hex(0xB0B0B0), 0);
+        RefreshBatteryLabel();
+
+        lv_obj_t* hint = lv_label_create(setting_box_);
+        lv_obj_set_style_text_color(hint, lv_color_hex(0x808080), 0);
+        lv_label_set_text(hint, "下滑关闭");
+    }
+
+    void CloseSettings() {
+        if (lv_obj_is_valid(setting_box_)) {
+            lv_obj_delete(setting_box_);
+        }
+        setting_box_ = nullptr;
+        setting_aec_ = nullptr;
+        setting_battery_ = nullptr;
+    }
+
+    void RefreshBatteryLabel() {
+        if (!lv_obj_is_valid(setting_battery_)) {
+            return;
+        }
+        int level = 0;
+        bool charging = false;
+        bool discharging = false;
+        if (Board::GetInstance().GetBatteryLevel(level, charging, discharging)) {
+            std::string text = "电量 " + std::to_string(level) + "%";
+            if (charging) {
+                text += " (充电中)";
+            } else if (!discharging) {
+                text += " (未接电池)";
+            }
+            lv_label_set_text(setting_battery_, text.c_str());
+        } else {
+            lv_label_set_text(setting_battery_, "电量 --");
+        }
     }
 };
 
@@ -161,14 +442,22 @@ private:
     esp_io_expander_handle_t io_expander = NULL;
     PowerSaveTimer* power_save_timer_;
 
+    void SetDisplayAsleep(bool asleep) {
+        if (display_ != nullptr) {
+            static_cast<CustomLcdDisplay*>(display_)->SetAsleep(asleep);
+        }
+    }
+
     void InitializePowerSaveTimer() {
         power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
         power_save_timer_->OnEnterSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(true);
-            GetBacklight()->SetBrightness(20); });
+            GetBacklight()->SetBrightness(20);
+            SetDisplayAsleep(true); });
         power_save_timer_->OnExitSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(false);
-            GetBacklight()->RestoreBrightness(); });
+            GetBacklight()->RestoreBrightness();
+            SetDisplayAsleep(false); });
         power_save_timer_->OnShutdownRequest([this](){ 
             pmic_->PowerOff(); });
         power_save_timer_->SetEnabled(true);
@@ -272,6 +561,14 @@ private:
         esp_lcd_panel_disp_on_off(panel, true);
         display_ = new CustomLcdDisplay(panel_io, panel,
                                         DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+        // Let a touch bring the panel back out of power save. The callback runs
+        // in the LVGL task; PowerSaveTimer::WakeUp() only flips flags, and the
+        // display lock is recursive, so calling it from there is safe.
+        static_cast<CustomLcdDisplay*>(display_)->SetWakeCallback([this]() {
+            if (power_save_timer_ != nullptr) {
+                power_save_timer_->WakeUp();
+            }
+        });
         backlight_ = new CustomBacklight(panel_io);
         backlight_->RestoreBrightness();
     }
