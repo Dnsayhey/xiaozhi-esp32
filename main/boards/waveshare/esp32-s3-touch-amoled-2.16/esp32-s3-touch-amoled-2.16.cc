@@ -117,8 +117,17 @@ public:
         SpiLcdDisplay::SetupUI();
 
         DisplayLockGuard lock(this);
-        lv_obj_set_style_pad_left(status_bar_, LV_HOR_RES*  0.1, 0);
-        lv_obj_set_style_pad_right(status_bar_, LV_HOR_RES*  0.1, 0);
+        // The status icons (network on the left, mute/battery on the right)
+        // live in top_bar_ and sit flush against the screen edges, so the
+        // rounded corners clip them. Inset the bar itself.
+        if (top_bar_ != nullptr) {
+            lv_obj_set_style_pad_left(top_bar_, DISPLAY_CORNER_INSET, 0);
+            lv_obj_set_style_pad_right(top_bar_, DISPLAY_CORNER_INSET, 0);
+        }
+        // status_bar_ only holds centred text, but keep it clear of the
+        // corners too so long strings do not run into the radius.
+        lv_obj_set_style_pad_left(status_bar_, DISPLAY_CORNER_INSET, 0);
+        lv_obj_set_style_pad_right(status_bar_, DISPLAY_CORNER_INSET, 0);
         lv_display_add_event_cb(display_, rounder_event_cb, LV_EVENT_INVALIDATE_AREA, NULL);
     }
 };

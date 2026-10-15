@@ -35,6 +35,13 @@
 
 #define DISPLAY_WIDTH 480
 #define DISPLAY_HEIGHT 480
+
+// The 480x480 AMOLED has rounded corners. The status icons are laid out
+// flush against the screen edges, so this is how far they are pulled
+// inboard to stay inside the corner radius.
+// Raise it if the icons still look clipped, lower it if they sit too far in.
+#define DISPLAY_CORNER_INSET 48
+
 #define DISPLAY_MIRROR_X false
 #define DISPLAY_MIRROR_Y false
 #define DISPLAY_SWAP_XY false
