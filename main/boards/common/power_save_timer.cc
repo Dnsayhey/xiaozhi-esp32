@@ -103,6 +103,17 @@ void PowerSaveTimer::PowerSaveCheck() {
     }
 }
 
+void PowerSaveTimer::SleepNow() {
+    if (in_sleep_mode_) {
+        return;
+    }
+    ESP_LOGI(TAG, "Entering power save mode on request");
+    in_sleep_mode_ = true;
+    if (on_enter_sleep_mode_) {
+        on_enter_sleep_mode_();
+    }
+}
+
 void PowerSaveTimer::WakeUp() {
     ticks_ = 0;
     if (in_sleep_mode_) {

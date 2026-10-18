@@ -15,6 +15,9 @@ public:
     void OnExitSleepMode(std::function<void()> callback);
     void OnShutdownRequest(std::function<void()> callback);
     void WakeUp();
+    // Enter sleep mode right away instead of waiting for the idle timeout.
+    // Goes through the same state as the timer so WakeUp() still works.
+    void SleepNow();
 
 private:
     void PowerSaveCheck();
