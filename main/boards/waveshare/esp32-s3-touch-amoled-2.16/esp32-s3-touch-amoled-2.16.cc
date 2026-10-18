@@ -27,6 +27,10 @@
 #include <functional>
 #include <string>
 
+#include <esp_random.h>
+#include <cstdlib>
+#include <ctime>
+
 #define TAG "WaveshareEsp32s3TouchAMOLED2inch16"
 
 class Pmic : public Axp2101 {
@@ -171,6 +175,14 @@ private:
     lv_obj_t* setting_box_ = nullptr;
     lv_obj_t* setting_aec_ = nullptr;
     lv_obj_t* setting_battery_ = nullptr;
+    lv_obj_t* setting_clock_ = nullptr;
+    // Screensaver: a full screen black plate created while asleep, with the
+    // clock on top of it. Destroyed on wake.
+    lv_obj_t* screensaver_box_ = nullptr;
+    lv_obj_t* clock_label_ = nullptr;
+    int clock_minute_ = -1;  // minute currently shown, -1 forces a redraw
+    int clock_x_ = -1;
+    int clock_y_ = -1;
 
     static CustomLcdDisplay* Self(lv_event_t* e) {
         return static_cast<CustomLcdDisplay*>(lv_event_get_user_data(e));
@@ -183,12 +195,14 @@ private:
             return;
         }
         self->gesture_seen_ = false;  // a new touch starts here
+        // Read the flag first: the wake callback clears it, which used to make
+        // the swallow below never happen and every wake-up start a conversation.
+        bool was_asleep = self->asleep_;
         if (self->wake_callback_) {
             self->wake_callback_();
         }
-        if (self->asleep_) {
+        if (was_asleep) {
             // This touch only woke the screen up, so drop the rest of it.
-            self->asleep_ = false;
             self->swallow_input_ = true;
         }
     }
@@ -221,39 +235,24 @@ private:
         }
         self->gesture_seen_ = true;
 
-        auto dir = lv_indev_get_gesture_dir(lv_indev_active());
-        lv_point_t point = {};
-        lv_indev_get_point(lv_indev_active(), &point);
-
         if (self->swallow_input_) {
             self->swallow_input_ = false;
             return;
         }
 
-        DisplayLockGuard lock(self);
-        if (lv_obj_is_valid(self->setting_box_)) {
-            // A drag on one of the panel's own controls is reported as a
-            // gesture too, so only a downward swipe closes the panel; any
-            // other direction is left to the widget under the finger.
-            if (dir == LV_DIR_BOTTOM) {
-                self->CloseSettings();
-                return;
-            }
-            lv_area_t box = {};
-            lv_obj_get_coords(self->setting_box_, &box);
-            if (point.x >= box.x1 && point.x <= box.x2 && point.y >= box.y1 &&
-                point.y <= box.y2) {
-                return;
-            }
-            self->CloseSettings();
+        // Only vertical swipes matter: either direction opens the settings
+        // panel, and either direction closes it again. Requiring a particular
+        // direction only made it easy to get wrong. Horizontal swipes belong to
+        // the sliders inside the panel, so they are ignored here.
+        auto dir = lv_indev_get_gesture_dir(lv_indev_active());
+        if (dir != LV_DIR_TOP && dir != LV_DIR_BOTTOM) {
             return;
         }
-        auto& app = Application::GetInstance();
-        if (dir == LV_DIR_TOP) {
-            app.ToggleChatState();
-        } else if (dir == LV_DIR_BOTTOM) {
-            // Open from any state. Requiring idle made this unreachable in
-            // practice, because a tap has usually already started listening.
+
+        DisplayLockGuard lock(self);
+        if (lv_obj_is_valid(self->setting_box_)) {
+            self->CloseSettings();
+        } else {
             self->OpenSettings();
         }
     }
@@ -326,7 +325,7 @@ private:
         setting_box_ = lv_obj_create(lv_screen_active());
         // Kept deliberately smaller than the screen and slightly translucent so
         // the chat underneath stays readable while the panel is open.
-        lv_obj_set_size(setting_box_, lv_pct(86), lv_pct(62));
+        lv_obj_set_size(setting_box_, lv_pct(86), lv_pct(72));
         lv_obj_center(setting_box_);
         lv_obj_set_style_bg_color(setting_box_, lv_color_hex(0x101014), 0);
         lv_obj_set_style_bg_opa(setting_box_, LV_OPA_80, 0);
@@ -372,15 +371,28 @@ private:
         lv_obj_add_event_cb(setting_aec_, OnAecChanged, LV_EVENT_VALUE_CHANGED, nullptr);
 #endif
 
+        // Screensaver: a migrating clock, or a blank panel. Stored so the
+        // choice survives a reboot.
+        lv_obj_t* clock_row = MakeRow(setting_box_);
+        lv_obj_t* clock_text = lv_label_create(clock_row);
+        lv_label_set_text(clock_text, "息屏时钟");
+        lv_obj_set_style_text_color(clock_text, lv_color_white(), 0);
+        lv_obj_align(clock_text, LV_ALIGN_LEFT_MID, 0, 0);
+
+        setting_clock_ = lv_switch_create(clock_row);
+        lv_obj_set_size(setting_clock_, 50, 25);
+        lv_obj_set_ext_click_area(setting_clock_, 12);
+        lv_obj_align(setting_clock_, LV_ALIGN_RIGHT_MID, 0, 0);
+        if (ScreensaverClockEnabled()) {
+            lv_obj_add_state(setting_clock_, LV_STATE_CHECKED);
+        }
+        lv_obj_add_event_cb(setting_clock_, OnClockChanged, LV_EVENT_VALUE_CHANGED, nullptr);
+
         // Battery level, straight from the AXP2101.
         setting_battery_ = lv_label_create(setting_box_);
         lv_obj_set_style_text_font(setting_battery_, text_font, 0);
         lv_obj_set_style_text_color(setting_battery_, lv_color_hex(0xB0B0B0), 0);
         RefreshBatteryLabel();
-
-        lv_obj_t* hint = lv_label_create(setting_box_);
-        lv_obj_set_style_text_color(hint, lv_color_hex(0x808080), 0);
-        lv_label_set_text(hint, "下滑关闭");
     }
 
     void CloseSettings() {
@@ -390,6 +402,187 @@ private:
         setting_box_ = nullptr;
         setting_aec_ = nullptr;
         setting_battery_ = nullptr;
+        setting_clock_ = nullptr;
+    }
+
+public:
+    // --------------------------------------------------------------- screensaver
+    // Showing a slowly migrating clock instead of blanking the panel keeps the
+    // time readable while spreading the wear over the whole display, so no
+    // static image is burned in. When the user turns it off the panel is
+    // switched off outright, which emits nothing at all.
+
+    static constexpr int kClockInset = 60;  // stay clear of the rounded corners
+
+    static bool ScreensaverClockEnabled() {
+        Settings settings("display", false);
+        return settings.GetBool("screensaver", true);
+    }
+
+    static void OnClockChanged(lv_event_t* e) {
+        auto* sw = static_cast<lv_obj_t*>(lv_event_get_target(e));
+        Settings settings("display", true);
+        settings.SetBool("screensaver", lv_obj_has_state(sw, LV_STATE_CHECKED));
+    }
+
+    // The application already ticks UpdateStatusBar() once a second, so the
+    // screensaver clock can ride on that instead of running a timer of its own.
+    // Redraw only when the displayed minute actually changes, which is what the
+    // stock status bar clock does and what keeps the phase from drifting.
+    void UpdateStatusBar(bool update_all = false) override {
+        SpiLcdDisplay::UpdateStatusBar(update_all);
+
+        if (!lv_obj_is_valid(clock_label_)) {
+            return;
+        }
+        auto now = time(nullptr);
+        tm tm_now = {};
+        if (localtime_r(&now, &tm_now) == nullptr) {
+            return;
+        }
+        int minute = tm_now.tm_hour * 60 + tm_now.tm_min;
+        if (!update_all && minute == clock_minute_) {
+            return;
+        }
+        DisplayLockGuard lock(this);
+        clock_minute_ = minute;
+        UpdateClockText();
+        MoveClock();
+    }
+
+    void UpdateClockText() {
+        if (!lv_obj_is_valid(clock_label_)) {
+            return;
+        }
+        auto now = time(nullptr);
+        tm tm_now = {};
+        char text[16];
+        // The clock is only set from the server once the device is online, so
+        // guard against the 1970 epoch and show a placeholder until then.
+        if (localtime_r(&now, &tm_now) == nullptr || tm_now.tm_year < 120) {
+            lv_label_set_text(clock_label_, "--:--");
+            return;
+        }
+        strftime(text, sizeof(text), "%H:%M", &tm_now);
+        lv_label_set_text(clock_label_, text);
+    }
+
+    void MoveClock() {
+        if (!lv_obj_is_valid(clock_label_)) {
+            return;
+        }
+        lv_obj_update_layout(clock_label_);
+        int max_x = LV_HOR_RES - lv_obj_get_width(clock_label_) - kClockInset;
+        int max_y = LV_VER_RES - lv_obj_get_height(clock_label_) - kClockInset;
+        if (max_x < kClockInset) {
+            max_x = kClockInset;
+        }
+        if (max_y < kClockInset) {
+            max_y = kClockInset;
+        }
+        int x = clock_x_;
+        int y = clock_y_;
+        // Keep moving away from the previous spot so the wear keeps spreading
+        // instead of settling on a few favourite positions.
+        for (int attempt = 0; attempt < 5; attempt++) {
+            int nx = kClockInset + (int)(esp_random() % (uint32_t)(max_x - kClockInset + 1));
+            int ny = kClockInset + (int)(esp_random() % (uint32_t)(max_y - kClockInset + 1));
+            x = nx;
+            y = ny;
+            if (std::abs(nx - clock_x_) >= 60 || std::abs(ny - clock_y_) >= 60) {
+                break;
+            }
+        }
+        clock_x_ = x;
+        clock_y_ = y;
+        lv_obj_set_pos(clock_label_, x, y);
+        lv_obj_move_foreground(clock_label_);
+    }
+
+    // The screensaver is the topmost input surface while the panel is dark, so
+    // it owns the press that brings the device back. Passing input through to
+    // whatever page happened to be open underneath let a clickable layer there
+    // swallow the wake touch. Blank mode keeps the plate transparent but still
+    // clickable, for the same reason.
+    void ShowScreensaver(bool with_clock) {
+        DisplayLockGuard lock(this);
+        if (!lv_obj_is_valid(screensaver_box_)) {
+            screensaver_box_ = lv_obj_create(lv_screen_active());
+            lv_obj_remove_style_all(screensaver_box_);
+            lv_obj_set_size(screensaver_box_, LV_HOR_RES, LV_VER_RES);
+            lv_obj_set_pos(screensaver_box_, 0, 0);
+            lv_obj_add_flag(screensaver_box_, LV_OBJ_FLAG_IGNORE_LAYOUT);
+            lv_obj_remove_flag(screensaver_box_, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(screensaver_box_, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(screensaver_box_, OnPressed, LV_EVENT_PRESSED, this);
+            lv_obj_add_event_cb(screensaver_box_, OnClicked, LV_EVENT_CLICKED, this);
+            lv_obj_add_event_cb(screensaver_box_, OnGesture, LV_EVENT_GESTURE, this);
+        }
+        // On an AMOLED a black pixel emits nothing, so an opaque plate hides the
+        // chat ui without adding panel wear; only the digits light up.
+        lv_obj_set_style_bg_color(screensaver_box_, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(screensaver_box_, with_clock ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+        lv_obj_move_foreground(screensaver_box_);
+        if (!with_clock) {
+            // Panel off: the plate is invisible and only catches the wake touch.
+            return;
+        }
+        if (!lv_obj_is_valid(clock_label_)) {
+            // Parent it to the plate rather than the screen: the screen carries
+            // a layout that would snap the label back to the top left corner.
+            clock_label_ = lv_label_create(screensaver_box_);
+            lv_obj_add_flag(clock_label_, LV_OBJ_FLAG_IGNORE_LAYOUT);
+            auto theme = static_cast<LvglTheme*>(current_theme_);
+            lv_obj_set_style_text_font(clock_label_, theme->text_font()->font(), 0);
+            lv_obj_set_style_text_color(clock_label_, lv_color_white(), 0);
+            // A dark plate behind the digits keeps them readable whatever the
+            // chat page happens to show underneath.
+            lv_obj_set_style_bg_color(clock_label_, lv_color_black(), 0);
+            lv_obj_set_style_bg_opa(clock_label_, LV_OPA_60, 0);
+            lv_obj_set_style_pad_all(clock_label_, 10, 0);
+            lv_obj_set_style_radius(clock_label_, 12, 0);
+            // Must stay transparent to input, otherwise it would swallow the
+            // touch that is supposed to wake the panel.
+            lv_obj_remove_flag(clock_label_, LV_OBJ_FLAG_CLICKABLE);
+        }
+        clock_x_ = -1;
+        clock_y_ = -1;
+        UpdateClockText();
+        MoveClock();
+        // Remember which minute is on screen so the per-second tick below only
+        // redraws when it actually rolls over.
+        auto now = time(nullptr);
+        tm tm_now = {};
+        clock_minute_ = (localtime_r(&now, &tm_now) != nullptr)
+                            ? tm_now.tm_hour * 60 + tm_now.tm_min
+                            : -1;
+    }
+
+    void HideScreensaver() {
+        DisplayLockGuard lock(this);
+        if (lv_obj_is_valid(clock_label_)) {
+            lv_obj_delete(clock_label_);
+        }
+        clock_label_ = nullptr;
+        if (lv_obj_is_valid(screensaver_box_)) {
+            lv_obj_delete(screensaver_box_);
+        }
+        screensaver_box_ = nullptr;
+    }
+
+    // Panel power, i.e. the CO5300 DISPOFF/DISPON commands. Unlike a zero
+    // backlight this stops the pixels emitting altogether, so nothing can burn
+    // in. Everything else on the device keeps running.
+    void SetPanelPower(bool on) {
+        DisplayLockGuard lock(this);
+        if (panel_ != nullptr) {
+            esp_lcd_panel_disp_on_off(panel_, on);
+        }
+        if (on) {
+            // The panel shows whatever is in its GRAM, so force a repaint to be
+            // sure the first frame after waking is current.
+            lv_obj_invalidate(lv_screen_active());
+        }
     }
 
     void RefreshBatteryLabel() {
@@ -402,7 +595,7 @@ private:
         if (Board::GetInstance().GetBatteryLevel(level, charging, discharging)) {
             std::string text = "电量 " + std::to_string(level) + "%";
             if (charging) {
-                text += " (充电中)";
+                text += (level >= 100) ? " (已充满)" : " (充电中)";
             } else if (!discharging) {
                 text += " (未接电池)";
             }
@@ -437,15 +630,52 @@ private:
     i2c_master_bus_handle_t i2c_bus_;
     Pmic* pmic_ = nullptr;
     Button boot_button_;
+    Button key_button_;
     CustomLcdDisplay* display_;
     CustomBacklight* backlight_;
     esp_io_expander_handle_t io_expander = NULL;
     PowerSaveTimer* power_save_timer_;
+    bool screensaver_active_ = false;
+
+    // Backlight level while the screensaver clock is showing. Low enough to be
+    // unobtrusive at night and to keep the panel wear minimal.
+    static constexpr int kScreensaverBrightness = 30;
 
     void SetDisplayAsleep(bool asleep) {
         if (display_ != nullptr) {
             static_cast<CustomLcdDisplay*>(display_)->SetAsleep(asleep);
         }
+    }
+
+    // Shared by the idle timer and the KEY button so both paths behave the same.
+    void EnterScreensaver() {
+        if (screensaver_active_ || display_ == nullptr) {
+            return;
+        }
+        screensaver_active_ = true;
+        SetDisplayAsleep(true);
+        auto* display = static_cast<CustomLcdDisplay*>(display_);
+        const bool with_clock = CustomLcdDisplay::ScreensaverClockEnabled();
+        if (with_clock) {
+            GetBacklight()->SetBrightness(kScreensaverBrightness);
+        } else {
+            GetBacklight()->SetBrightness(0);
+            display->SetPanelPower(false);
+        }
+        // The plate goes up last so it is the topmost input surface.
+        display->ShowScreensaver(with_clock);
+    }
+
+    void ExitScreensaver() {
+        if (!screensaver_active_ || display_ == nullptr) {
+            return;
+        }
+        screensaver_active_ = false;
+        auto* display = static_cast<CustomLcdDisplay*>(display_);
+        display->HideScreensaver();
+        display->SetPanelPower(true);
+        GetBacklight()->RestoreBrightness();
+        SetDisplayAsleep(false);
     }
 
     void InitializePowerSaveTimer() {
@@ -461,14 +691,8 @@ private:
         // cpu_max_freq is -1, so "sleep" only dims the panel; it does not
         // enter light sleep and does not disturb USB.
         power_save_timer_ = new PowerSaveTimer(-1, 60, -1);
-        power_save_timer_->OnEnterSleepMode([this]() {
-            GetDisplay()->SetPowerSaveMode(true);
-            GetBacklight()->SetBrightness(20);
-            SetDisplayAsleep(true); });
-        power_save_timer_->OnExitSleepMode([this]() {
-            GetDisplay()->SetPowerSaveMode(false);
-            GetBacklight()->RestoreBrightness();
-            SetDisplayAsleep(false); });
+        power_save_timer_->OnEnterSleepMode([this]() { EnterScreensaver(); });
+        power_save_timer_->OnExitSleepMode([this]() { ExitScreensaver(); });
         power_save_timer_->OnShutdownRequest([this](){ 
             pmic_->PowerOff(); });
         power_save_timer_->SetEnabled(true);
@@ -531,6 +755,21 @@ private:
             }
         });
 #endif
+
+        // KEY: put the display to sleep straight away, and bring it back on the
+        // next press. Waveshare documents this side button as GPIO 18.
+        key_button_.OnClick([this]() {
+            if (power_save_timer_ == nullptr) {
+                return;
+            }
+            // Go through the timer so it records the state; otherwise WakeUp()
+            // ignores later activity and the screen would stay dark.
+            if (screensaver_active_) {
+                power_save_timer_->WakeUp();
+            } else {
+                power_save_timer_->SleepNow();
+            }
+        });
     }
 
     void InitializeDisplay() {
@@ -579,6 +818,9 @@ private:
             if (power_save_timer_ != nullptr) {
                 power_save_timer_->WakeUp();
             }
+            // Idempotent: WakeUp() already goes through OnExitSleepMode when the
+            // timer owns the sleep, but the KEY button can start one on its own.
+            ExitScreensaver();
         });
         backlight_ = new CustomBacklight(panel_io);
         backlight_->RestoreBrightness();
@@ -631,7 +873,8 @@ private:
     }
 
 public:
-    WaveshareEsp32s3TouchAMOLED2inch16() : boot_button_(BOOT_BUTTON_GPIO) {
+    WaveshareEsp32s3TouchAMOLED2inch16()
+        : boot_button_(BOOT_BUTTON_GPIO), key_button_(KEY_BUTTON_GPIO) {
         InitializePowerSaveTimer();
         InitializeCodecI2c();
 #if CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_AMOLED_1_75
@@ -672,7 +915,10 @@ public:
 
     virtual bool GetBatteryLevel(int &level, bool &charging, bool &discharging) override {
         static bool last_discharging = false;
-        charging = pmic_->IsCharging();
+        // A full pack on USB sits in standby: the AXP2101 reports neither
+        // direction, which used to be indistinguishable from "no battery".
+        // Charge-done is the signal that tells the two apart.
+        charging = pmic_->IsCharging() || pmic_->IsChargingDone();
         discharging = pmic_->IsDischarging();
         if (discharging != last_discharging)
         {

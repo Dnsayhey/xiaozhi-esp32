@@ -25,6 +25,9 @@
 
 #define I2C_ADDRESS         ESP_IO_EXPANDER_I2C_TCA9554_ADDRESS_000
 #define BOOT_BUTTON_GPIO GPIO_NUM_0
+// The third side button, labelled KEY on the case. Waveshare documents it as
+// "GPIO 18 button, user programmable".
+#define KEY_BUTTON_GPIO GPIO_NUM_18
 
 #define EXAMPLE_PIN_NUM_LCD_CS GPIO_NUM_12
 #define EXAMPLE_PIN_NUM_LCD_PCLK GPIO_NUM_38
