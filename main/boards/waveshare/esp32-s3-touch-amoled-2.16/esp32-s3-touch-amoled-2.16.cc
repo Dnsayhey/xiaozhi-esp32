@@ -449,7 +449,18 @@ private:
     }
 
     void InitializePowerSaveTimer() {
-        power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
+        // Dim after a minute of idle, but never power off on our own.
+        //
+        // The timer is enabled unconditionally below and the stock 300s
+        // shutdown therefore fires whether or not the board is on the
+        // charger: the AXP2101 reports "discharging" even while charging
+        // whenever the system load exceeds the charge current, so the device
+        // switched itself off five minutes after being plugged in. Holding
+        // PWR for four seconds still powers it off on demand.
+        //
+        // cpu_max_freq is -1, so "sleep" only dims the panel; it does not
+        // enter light sleep and does not disturb USB.
+        power_save_timer_ = new PowerSaveTimer(-1, 60, -1);
         power_save_timer_->OnEnterSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(true);
             GetBacklight()->SetBrightness(20);
