@@ -33,6 +33,12 @@
 
 #define TAG "WaveshareEsp32s3TouchAMOLED2inch16"
 
+// LVGL sizes a label's box to its line height, so the glyphs sit a little above
+// the box centre, while a switch or a slider draws symmetrically in its box.
+// Next to a label the controls therefore read as slightly low; this nudge lifts
+// them back onto the same visual line in every settings row.
+constexpr int kControlBaselineNudge = -2;
+
 class Pmic : public Axp2101 {
 public:
     Pmic(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : Axp2101(i2c_bus, addr) {
@@ -307,7 +313,7 @@ private:
 
         lv_obj_t* slider = lv_slider_create(row);
         lv_obj_set_size(slider, lv_pct(62), 10);
-        lv_obj_align(slider, LV_ALIGN_RIGHT_MID, 0, 0);
+        lv_obj_align(slider, LV_ALIGN_RIGHT_MID, 0, kControlBaselineNudge);
         lv_slider_set_range(slider, min_value, 100);
         lv_slider_set_value(slider, value, LV_ANIM_OFF);
         lv_obj_set_ext_click_area(slider, 16);
@@ -364,7 +370,7 @@ private:
         setting_aec_ = lv_switch_create(aec_row);
         lv_obj_set_size(setting_aec_, 50, 25);
         lv_obj_set_ext_click_area(setting_aec_, 12);
-        lv_obj_align(setting_aec_, LV_ALIGN_RIGHT_MID, 0, 0);
+        lv_obj_align(setting_aec_, LV_ALIGN_RIGHT_MID, 0, kControlBaselineNudge);
         if (Application::GetInstance().GetAecMode() != kAecOff) {
             lv_obj_add_state(setting_aec_, LV_STATE_CHECKED);
         }
@@ -382,7 +388,7 @@ private:
         setting_clock_ = lv_switch_create(clock_row);
         lv_obj_set_size(setting_clock_, 50, 25);
         lv_obj_set_ext_click_area(setting_clock_, 12);
-        lv_obj_align(setting_clock_, LV_ALIGN_RIGHT_MID, 0, 0);
+        lv_obj_align(setting_clock_, LV_ALIGN_RIGHT_MID, 0, kControlBaselineNudge);
         if (ScreensaverClockEnabled()) {
             lv_obj_add_state(setting_clock_, LV_STATE_CHECKED);
         }
