@@ -1,23 +1,27 @@
-#include "wifi_board.h"
 #include "display/lcd_display.h"
-#include "lvgl_theme.h"
 #include "esp_lcd_co5300.h"
+#include "lvgl_theme.h"
+#include "wifi_board.h"
 
-#include "codecs/box_audio_codec.h"
+#include <material_symbols.h>
+#include "alarm.h"
+#include "alarm_view.h"
 #include "application.h"
+#include "assets/lang_config.h"
+#include "auto_rotation.h"
+#include "axp2101.h"
 #include "button.h"
+#include "codecs/box_audio_codec.h"
+#include "config.h"
+#include "i2c_device.h"
 #include "led/single_led.h"
 #include "mcp_server.h"
-#include "config.h"
 #include "power_save_timer.h"
-#include "axp2101.h"
-#include "i2c_device.h"
-#include "auto_rotation.h"
 
-#include <esp_log.h>
-#include <esp_lcd_panel_vendor.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_master.h>
+#include <esp_lcd_panel_vendor.h>
+#include <esp_log.h>
 #include "esp_io_expander_tca9554.h"
 #include "settings.h"
 
@@ -41,11 +45,17 @@
 // them back onto the same visual line in every settings row.
 constexpr int kControlBaselineNudge = -2;
 
+// status_bar_ sits on the screen, above every page, so pages start below it.
+constexpr int kStatusBarInset = 52;
+
+// Roughly the I2S tail left in the DMA buffer when playback is dropped.
+constexpr int kRingFadeMs = 220;
+
 class Pmic : public Axp2101 {
 public:
     Pmic(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : Axp2101(i2c_bus, addr) {
-        WriteReg(0x22, 0b110); // PWRON > OFFLEVEL as POWEROFF Source enable
-        WriteReg(0x27, 0x10);  // hold 4s to power off
+        WriteReg(0x22, 0b110);  // PWRON > OFFLEVEL as POWEROFF Source enable
+        WriteReg(0x27, 0x10);   // hold 4s to power off
 
         // Disable All DCs but DC1
         WriteReg(0x80, 0x01);
@@ -62,11 +72,12 @@ public:
         // Enable ALDO1(MIC)
         WriteReg(0x90, 0x01);
 
-        WriteReg(0x64, 0x02); // CV charger voltage setting to 4.1V
+        WriteReg(0x64, 0x02);  // CV charger voltage setting to 4.1V
 
-        WriteReg(0x61, 0x02); // set Main battery precharge current to 50mA
-        WriteReg(0x62, 0x08); // set Main battery charger current to 400mA ( 0x08-200mA, 0x09-300mA, 0x0A-400mA )
-        WriteReg(0x63, 0x01); // set Main battery term charge current to 25mA
+        WriteReg(0x61, 0x02);  // set Main battery precharge current to 50mA
+        WriteReg(0x62, 0x08);  // set Main battery charger current to 400mA ( 0x08-200mA,
+                               // 0x09-300mA, 0x0A-400mA )
+        WriteReg(0x63, 0x01);  // set Main battery term charge current to 25mA
     }
 };
 
@@ -75,7 +86,7 @@ public:
 #define LCD_OPCODE_WRITE_COLOR (0x32ULL)
 
 static const co5300_lcd_init_cmd_t vendor_specific_init[] = {
-    {0x11, (uint8_t[]){0x00}, 0, 600}, // Sleep out
+    {0x11, (uint8_t[]){0x00}, 0, 600},  // Sleep out
 
     {0xFE, (uint8_t[]){0x20}, 1, 0},
     {0x19, (uint8_t[]){0x10}, 1, 0},
@@ -98,7 +109,7 @@ static const co5300_lcd_init_cmd_t vendor_specific_init[] = {
 class CustomLcdDisplay : public SpiLcdDisplay {
 public:
     static void rounder_event_cb(lv_event_t* e) {
-        lv_area_t* area = (lv_area_t* )lv_event_get_param(e);
+        lv_area_t* area = (lv_area_t*)lv_event_get_param(e);
         uint16_t x1 = area->x1;
         uint16_t x2 = area->x2;
 
@@ -113,17 +124,11 @@ public:
         area->y2 = ((y2 >> 1) << 1) + 1;
     }
 
-    CustomLcdDisplay(esp_lcd_panel_io_handle_t io_handle,
-                     esp_lcd_panel_handle_t panel_handle,
-                     int width,
-                     int height,
-                     int offset_x,
-                     int offset_y,
-                     bool mirror_x,
-                     bool mirror_y,
-                     bool swap_xy)
-        : SpiLcdDisplay(io_handle, panel_handle,
-                        width, height, offset_x, offset_y, mirror_x, mirror_y, swap_xy) {
+    CustomLcdDisplay(esp_lcd_panel_io_handle_t io_handle, esp_lcd_panel_handle_t panel_handle,
+                     int width, int height, int offset_x, int offset_y, bool mirror_x,
+                     bool mirror_y, bool swap_xy)
+        : SpiLcdDisplay(io_handle, panel_handle, width, height, offset_x, offset_y, mirror_x,
+                        mirror_y, swap_xy) {
         // Note: UI customization should be done in SetupUI(), not in constructor
         // to ensure lvgl objects are created before accessing them
     }
@@ -171,9 +176,8 @@ public:
     // the bus over here keeps the sensor behind this class, which is where the
     // orientation it drives belongs.
     void AttachImu(i2c_master_bus_handle_t bus) {
-        auto_rotation_.Start(
-            [this](int degrees) { SetRotation(degrees); },
-            [this]() { return asleep_ || !auto_rotation_enabled_; }, bus);
+        auto_rotation_.Start([this](int degrees) { SetRotation(degrees); },
+                             [this]() { return asleep_ || !auto_rotation_enabled_; }, bus);
     }
 
     bool AutoRotationEnabled() const { return auto_rotation_enabled_; }
@@ -223,6 +227,13 @@ public:
         }
 
         lv_display_add_event_cb(display_, rounder_event_cb, LV_EVENT_INVALIDATE_AREA, NULL);
+
+        // The alarm clock rides the per-second refresh below, so it needs no
+        // timer of its own.
+        alarm_.Init([this](const Alarm::Entry& entry, bool first) { OnAlarmRing(entry, first); },
+                    [this]() { OnAlarmStopped(); }, [this]() { AlarmsChanged(); });
+        // A tap on the ring overlay silences the alarm.
+        alarm_view_.SetStopHandler([this]() { alarm_.StopRinging(); });
     }
 
 private:
@@ -254,6 +265,16 @@ private:
     auto_rotation::Controller auto_rotation_;
     // Read by the orientation task, written by the settings UI.
     std::atomic<bool> auto_rotation_enabled_{false};
+
+    // Alarms live here because the page that shows them does.
+    Alarm alarm_;
+    AlarmView alarm_view_{alarm_};
+    enum class Page { kChat, kAlarm };
+    Page page_ = Page::kChat;
+    lv_obj_t* alarm_page_ = nullptr;
+    // A refresh rebuilds the rows, which can arrive from a row's own event
+    // callback, so it is deferred to the next LVGL pass instead.
+    bool refresh_pending_ = false;
 
     static CustomLcdDisplay* Self(lv_event_t* e) {
         return static_cast<CustomLcdDisplay*>(lv_event_get_user_data(e));
@@ -332,6 +353,13 @@ private:
         if (self->wake_callback_) {
             self->wake_callback_();
         }
+        if (was_asleep && self->alarm_.ringing()) {
+            // The touch that woke the screen for an alarm should also silence it;
+            // making the user tap twice is just annoying at that point.
+            self->alarm_.StopRinging();
+            self->swallow_input_ = false;
+            return;
+        }
         if (was_asleep) {
             // This touch only woke the screen up, so drop the rest of it.
             self->swallow_input_ = true;
@@ -353,8 +381,19 @@ private:
             self->gesture_seen_ = false;
             return;
         }
+        // A tap while an alarm rings silences it. This has to come before the
+        // settings guard: the ring page covers the screen, but a stray swipe can
+        // still have opened the panel on top of it, and then the alarm could not
+        // be dismissed at all.
+        if (self->alarm_.ringing()) {
+            self->alarm_.StopRinging();
+            return;
+        }
         if (lv_obj_is_valid(self->setting_box_)) {
             return;  // taps are ignored while the settings panel is open
+        }
+        if (self->page_ != Page::kChat) {
+            return;
         }
         Application::GetInstance().ToggleChatState();
     }
@@ -373,7 +412,19 @@ private:
 
         // Vertical in the UI's own frame: the touch transform already undoes the
         // panel rotation, so this stays TOP/BOTTOM at every angle.
+        // While an alarm sounds the ring page owns the screen; no swipes.
+        if (self->alarm_.ringing()) {
+            return;
+        }
         auto dir = lv_indev_get_gesture_dir(lv_indev_active());
+        if (dir == LV_DIR_LEFT || dir == LV_DIR_RIGHT) {
+            // Horizontal swipes change page, but not while the settings panel is
+            // open: its sliders are dragged horizontally.
+            if (!lv_obj_is_valid(self->setting_box_)) {
+                self->ShowPage(self->page_ == Page::kChat ? Page::kAlarm : Page::kChat);
+            }
+            return;
+        }
         if (dir != LV_DIR_TOP && dir != LV_DIR_BOTTOM) {
             return;
         }
@@ -419,6 +470,169 @@ private:
         self->SetAutoRotation(lv_obj_has_state(sw, LV_STATE_CHECKED));
     }
 
+    // ---- alarms and pages -------------------------------------------------
+
+public:
+    Alarm& alarm() { return alarm_; }
+
+    // The chat page is the centred emoji plus the message bar at the bottom; the
+    // icon row and the status line above them are shared, so they keep refreshing
+    // whichever page is up. There is no content_ container in this display
+    // variant, which is why the page swap works on those two pieces.
+    // The alarm page is created on entry and destroyed on exit. It is opaque and
+    // covers everything below the status line, so the chat widgets underneath need
+    // no bookkeeping at all - and being rebuilt each time, it always matches the
+    // current theme without a SetTheme hook.
+    void ShowPage(Page page) {
+        DisplayLockGuard lock(this);
+        if (page == Page::kAlarm) {
+            if (!lv_obj_is_valid(alarm_page_)) {
+                BuildAlarmPage();
+            }
+            RefreshAlarmPage();
+            lv_obj_remove_flag(alarm_page_, LV_OBJ_FLAG_HIDDEN);
+        } else if (lv_obj_is_valid(alarm_page_)) {
+            DestroyAlarmPage();
+        }
+        page_ = page;
+    }
+
+private:
+    void DestroyAlarmPage() {
+        if (lv_obj_is_valid(alarm_page_)) {
+            lv_obj_delete(alarm_page_);
+        }
+        alarm_page_ = nullptr;
+        alarm_view_.Reset();
+    }
+
+    void BuildAlarmPage() {
+        if (lv_obj_is_valid(alarm_page_)) {
+            return;
+        }
+        auto theme = static_cast<LvglTheme*>(current_theme_);
+        // The page starts below the status line and runs to the bottom edge. It is
+        // created after the bars, so sizing it is simpler than reordering the tree,
+        // and being opaque it hides the chat widgets without touching them.
+        alarm_page_ = lv_obj_create(lv_screen_active());
+        lv_obj_set_size(alarm_page_, LV_HOR_RES, LV_VER_RES - kStatusBarInset);
+        lv_obj_set_pos(alarm_page_, 0, kStatusBarInset);
+        lv_obj_set_style_radius(alarm_page_, 0, 0);
+        lv_obj_set_style_border_width(alarm_page_, 0, 0);
+        lv_obj_set_style_pad_all(alarm_page_, 20, 0);
+        lv_obj_set_style_bg_color(alarm_page_, theme->background_color(), 0);
+        lv_obj_set_style_bg_opa(alarm_page_, LV_OPA_COVER, 0);
+        lv_obj_set_flex_flow(alarm_page_, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(alarm_page_, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_row(alarm_page_, 8, 0);
+        lv_obj_set_scrollbar_mode(alarm_page_, LV_SCROLLBAR_MODE_OFF);
+        // The page covers the gesture surface, so it carries the handlers itself.
+        lv_obj_add_flag(alarm_page_, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(alarm_page_, OnPressed, LV_EVENT_PRESSED, this);
+        lv_obj_add_event_cb(alarm_page_, OnClicked, LV_EVENT_CLICKED, this);
+        lv_obj_add_event_cb(alarm_page_, OnGesture, LV_EVENT_GESTURE, this);
+
+        alarm_view_.Build(alarm_page_, theme);
+        lv_obj_add_flag(alarm_page_, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    void RefreshAlarmPage() { alarm_view_.Refresh(); }
+
+public:
+    // Called by Alarm while it is ringing, and again for each repeat.
+    void OnAlarmRing(const Alarm::Entry& entry, bool first) {
+        auto& app = Application::GetInstance();
+
+        if (first) {
+            const auto state = app.GetDeviceState();
+
+            // A reply must not be mixed into the alarm and the microphone must not
+            // stay open behind it. AbortSpeaking only tells the server; listening
+            // is left to StopListening() so its event still sends the stop and
+            // closes the channel, which is what lets the device sleep again later.
+            if (state == kDeviceStateSpeaking) {
+                app.AbortSpeaking(kAbortReasonNone);
+            } else if (state == kDeviceStateListening) {
+                app.StopListening();
+            } else if (state == kDeviceStateConnecting) {
+                app.SetDeviceState(kDeviceStateIdle);
+            }
+
+            // Anything still queued would play before the alarm tone.
+            app.GetAudioService().ResetDecoder();
+            ShowRingingPage();
+        }
+
+        // Not kDeviceStateNotifying: that state belongs to StopNotification(),
+        // which drops the audio queue and would silence the alarm outright.
+        // Waking here - and again on every repeat - keeps the power save timer
+        // from blanking the screen mid-ring.
+        if (wake_callback_) {
+            wake_callback_();
+        }
+        app.GetAudioService().PlaySound(Lang::Sounds::OGG_ALARM);
+        if (first) {
+            ESP_LOGI(TAG, "alarm %02d:%02d ringing", entry.hour, entry.minute);
+        }
+    }
+
+    // Any change to the list lands here. The refresh deletes and rebuilds the
+    // rows, and this can be reached from a row's own event callback, so it is
+    // scheduled for the next LVGL pass rather than run in place.
+    void AlarmsChanged() {
+        DisplayLockGuard lock(this);
+        if (refresh_pending_ || !alarm_view_.built()) {
+            return;
+        }
+        refresh_pending_ = true;
+        // lv_async_call runs once on the next LVGL pass, which is exactly the
+        // "not from inside this widget's own event" semantics needed here.
+        lv_async_call(
+            [](void* data) {
+                auto* display = static_cast<CustomLcdDisplay*>(data);
+                display->refresh_pending_ = false;
+                display->RefreshAlarmPage();
+            },
+            this);
+    }
+
+    void OnAlarmStopped() {
+        auto& app = Application::GetInstance();
+        // ResetDecoder() drops the queued audio; Stop() would latch
+        // service_stopped_ and only Start() unwinds that, which is what used to
+        // leave the wake word dead after an alarm.
+        app.GetAudioService().ResetDecoder();
+
+        // Safety net: whatever the ring interrupted, the device must not be left
+        // with the microphone or the audio channel open behind it.
+        const auto state = app.GetDeviceState();
+        if (state == kDeviceStateListening || state == kDeviceStateConnecting ||
+            state == kDeviceStateSpeaking) {
+            app.SetDeviceState(kDeviceStateIdle);
+        }
+
+        HideRingingPage();
+    }
+
+    // The overlay is owned by AlarmView; these just keep the names the ring flow
+    // uses so that logic stays readable.
+    void ShowRingingPage() {
+        DisplayLockGuard lock(this);
+        alarm_view_.ShowRinging(static_cast<LvglTheme*>(current_theme_));
+    }
+
+    void RefreshRingingClock() {
+        DisplayLockGuard lock(this);
+        alarm_view_.RefreshClock();
+    }
+
+    void HideRingingPage() {
+        DisplayLockGuard lock(this);
+        alarm_view_.HideRinging();
+    }
+
+private:
     static void OnAecChanged(lv_event_t* e) {
         auto* sw = static_cast<lv_obj_t*>(lv_event_get_target(e));
         auto& app = Application::GetInstance();
@@ -487,15 +701,15 @@ private:
         lv_obj_set_style_text_color(title, lv_color_white(), 0);
         lv_label_set_text(title, "设置");
 
-        AddSliderRow(setting_box_, "音量",
-                     Board::GetInstance().GetAudioCodec()->output_volume(), 0, OnVolumeChanged);
+        AddSliderRow(setting_box_, "音量", Board::GetInstance().GetAudioCodec()->output_volume(), 0,
+                     OnVolumeChanged);
 
         auto backlight = Board::GetInstance().GetBacklight();
         // The panel has no backlight GPIO: brightness goes straight into the
         // AMOLED command 0x51, where 0 means a completely dark screen. Keep a
         // floor so the slider cannot make the device unusable.
-        AddSliderRow(setting_box_, "亮度",
-                     backlight != nullptr ? backlight->brightness() : 50, 5, OnBrightnessChanged);
+        AddSliderRow(setting_box_, "亮度", backlight != nullptr ? backlight->brightness() : 50, 5,
+                     OnBrightnessChanged);
 
         // Automatic rotation and the current angle share one row. The switch
         // drives the sensor; tapping the angle steps the four values by hand,
@@ -605,6 +819,10 @@ public:
     // stock status bar clock does and what keeps the phase from drifting.
     void UpdateStatusBar(bool update_all = false) override {
         SpiLcdDisplay::UpdateStatusBar(update_all);
+
+        // Alarms are checked on the same tick the status bar already runs on.
+        alarm_.Tick(time(nullptr));
+        RefreshRingingClock();
 
         if (!lv_obj_is_valid(clock_label_)) {
             return;
@@ -727,9 +945,8 @@ public:
         // redraws when it actually rolls over.
         auto now = time(nullptr);
         tm tm_now = {};
-        clock_minute_ = (localtime_r(&now, &tm_now) != nullptr)
-                            ? tm_now.tm_hour * 60 + tm_now.tm_min
-                            : -1;
+        clock_minute_ =
+            (localtime_r(&now, &tm_now) != nullptr) ? tm_now.tm_hour * 60 + tm_now.tm_min : -1;
     }
 
     void HideScreensaver() {
@@ -793,7 +1010,7 @@ protected:
     virtual void SetBrightnessImpl(uint8_t brightness) override {
         auto display = Board::GetInstance().GetDisplay();
         DisplayLockGuard lock(display);
-        uint8_t data[1] = {((uint8_t)((255*  brightness) / 100))};
+        uint8_t data[1] = {((uint8_t)((255 * brightness) / 100))};
         int lcd_cmd = 0x51;
         lcd_cmd &= 0xff;
         lcd_cmd <<= 8;
@@ -870,8 +1087,7 @@ private:
         power_save_timer_ = new PowerSaveTimer(-1, 60, -1);
         power_save_timer_->OnEnterSleepMode([this]() { EnterScreensaver(); });
         power_save_timer_->OnExitSleepMode([this]() { ExitScreensaver(); });
-        power_save_timer_->OnShutdownRequest([this](){ 
-            pmic_->PowerOff(); });
+        power_save_timer_->OnShutdownRequest([this]() { pmic_->PowerOff(); });
         power_save_timer_->SetEnabled(true);
     }
 
@@ -882,9 +1098,10 @@ private:
             .sda_io_num = AUDIO_CODEC_I2C_SDA_PIN,
             .scl_io_num = AUDIO_CODEC_I2C_SCL_PIN,
             .clk_source = I2C_CLK_SRC_DEFAULT,
-            .flags = {
-                .enable_internal_pullup = 1,
-            },
+            .flags =
+                {
+                    .enable_internal_pullup = 1,
+                },
         };
         ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_));
     }
@@ -909,7 +1126,7 @@ private:
         buscfg.data1_io_num = EXAMPLE_PIN_NUM_LCD_DATA1;
         buscfg.data2_io_num = EXAMPLE_PIN_NUM_LCD_DATA2;
         buscfg.data3_io_num = EXAMPLE_PIN_NUM_LCD_DATA3;
-        buscfg.max_transfer_sz = DISPLAY_WIDTH*  DISPLAY_HEIGHT*  sizeof(uint16_t);
+        buscfg.max_transfer_sz = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t);
         buscfg.flags = SPICOMMON_BUSFLAG_QUAD;
         ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
     }
@@ -979,15 +1196,16 @@ private:
         panel_config.reset_gpio_num = EXAMPLE_PIN_NUM_LCD_RST;
         panel_config.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB;
         panel_config.bits_per_pixel = 16;
-        panel_config.vendor_config = (void* )&vendor_config;
+        panel_config.vendor_config = (void*)&vendor_config;
         ESP_ERROR_CHECK(esp_lcd_new_panel_co5300(panel_io, &panel_config, &panel));
         esp_lcd_panel_reset(panel);
         esp_lcd_panel_init(panel);
         esp_lcd_panel_invert_color(panel, false);
         esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
         esp_lcd_panel_disp_on_off(panel, true);
-        display_ = new CustomLcdDisplay(panel_io, panel,
-                                        DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+        display_ = new CustomLcdDisplay(panel_io, panel, DISPLAY_WIDTH, DISPLAY_HEIGHT,
+                                        DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X,
+                                        DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
         // Let a touch bring the panel back out of power save. The callback runs
         // in the LVGL task; PowerSaveTimer::WakeUp() only flips flags, and the
         // display lock is recursive, so calling it from there is safe.
@@ -1010,22 +1228,24 @@ private:
             .y_max = DISPLAY_HEIGHT - 1,
             .rst_gpio_num = PIN_NUM_TOUCH_RST,
             .int_gpio_num = PIN_NUM_TOUCH_INT,
-            .levels = {
-                .reset = 0,
-                .interrupt = 0,
-            },
-            .flags = {
-                .swap_xy = 0,
-                // The panel reports its coordinates rotated by 180 degrees
-                // relative to the LCD, so mirroring both axes put every touch
-                // at the opposite corner and flipped swipe directions.
-                .mirror_x = 0,
-                .mirror_y = 0,
-            },
+            .levels =
+                {
+                    .reset = 0,
+                    .interrupt = 0,
+                },
+            .flags =
+                {
+                    .swap_xy = 0,
+                    // The panel reports its coordinates rotated by 180 degrees
+                    // relative to the LCD, so mirroring both axes put every touch
+                    // at the opposite corner and flipped swipe directions.
+                    .mirror_x = 0,
+                    .mirror_y = 0,
+                },
         };
         esp_lcd_panel_io_handle_t tp_io_handle = NULL;
         esp_lcd_panel_io_i2c_config_t tp_io_config = ESP_LCD_TOUCH_IO_I2C_CST9217_CONFIG();
-        tp_io_config.scl_speed_hz = 400*  1000;
+        tp_io_config.scl_speed_hz = 400 * 1000;
         ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(i2c_bus_, &tp_io_config, &tp_io_handle));
         ESP_LOGI(TAG, "Initialize touch controller");
         ESP_ERROR_CHECK(esp_lcd_touch_new_i2c_cst9217(tp_io_handle, &tp_cfg, &tp));
@@ -1045,14 +1265,82 @@ private:
 
     // 初始化工具
     void InitializeTools() {
-        auto &mcp_server = McpServer::GetInstance();
+        auto& mcp_server = McpServer::GetInstance();
         mcp_server.AddTool("self.system.reconfigure_wifi",
-            "End this conversation and enter WiFi configuration mode.\n"
-            "**CAUTION** You must ask the user to confirm this action.",
-            PropertyList(), [this](const PropertyList& properties) {
-                EnterWifiConfigMode();
-                return true;
+                           "End this conversation and enter WiFi configuration mode.\n"
+                           "**CAUTION** You must ask the user to confirm this action.",
+                           PropertyList(), [this](const PropertyList& properties) {
+                               EnterWifiConfigMode();
+                               return true;
+                           });
+
+        // Alarms. The screen page only shows, toggles and removes what exists;
+        // adding one is a sentence to the assistant.
+        auto* alarm_display = static_cast<CustomLcdDisplay*>(display_);
+        mcp_server.AddTool(
+            "self.alarm.add",
+            "Add an alarm clock. weekdays is a bitmask with bit 0 = Monday through "
+            "bit 6 = Sunday: 127 is every day, 31 is Monday to Friday, 0 adds a "
+            "one-shot alarm that fires at the next occurrence and is then removed "
+            "from the list; it is what you get when weekdays is omitted. At most four "
+            "alarms can exist.",
+            PropertyList({Property("hour", kPropertyTypeInteger, 0, 23),
+                          Property("minute", kPropertyTypeInteger, 0, 59),
+                          Property("weekdays", kPropertyTypeInteger, 0, 0, 127)}),
+            [alarm_display](const PropertyList& properties) -> ReturnValue {
+                const int hour = properties["hour"].value<int>();
+                const int minute = properties["minute"].value<int>();
+                const uint8_t weekdays = static_cast<uint8_t>(properties["weekdays"].value<int>());
+                if (alarm_display->alarm().Add(hour, minute, weekdays) < 0) {
+                    return std::string(
+                        "Could not add the alarm: the list is full or the time is invalid.");
+                }
+                return std::string("Alarm added.");
             });
+
+        mcp_server.AddTool(
+            "self.alarm.list",
+            "List the alarm clocks with their index, time, weekday mask and whether they are "
+            "enabled.",
+            PropertyList(), [alarm_display](const PropertyList& properties) -> ReturnValue {
+                auto& alarm = alarm_display->alarm();
+                if (alarm.Empty()) {
+                    return std::string("No alarms are set.");
+                }
+                std::string out;
+                for (int i = 0; i < alarm.Count(); i++) {
+                    const Alarm::Entry entry = alarm.Get(i);
+                    char line[96];
+                    snprintf(line, sizeof(line), "%d: %02d:%02d weekdays=%d %s\n", i, entry.hour,
+                             entry.minute, entry.weekdays, entry.enabled ? "enabled" : "disabled");
+                    out += line;
+                }
+                return out;
+            });
+
+        mcp_server.AddTool("self.alarm.remove",
+                           "Remove the alarm at the given index, as reported by self.alarm.list.",
+                           PropertyList({Property("index", kPropertyTypeInteger, 0, 3)}),
+                           [alarm_display](const PropertyList& properties) -> ReturnValue {
+                               const int index = properties["index"].value<int>();
+                               if (!alarm_display->alarm().Remove(index)) {
+                                   return std::string("No alarm at that index.");
+                               }
+                               return std::string("Alarm removed.");
+                           });
+
+        mcp_server.AddTool("self.alarm.set_enabled",
+                           "Turn the alarm at the given index on or off without removing it.",
+                           PropertyList({Property("index", kPropertyTypeInteger, 0, 3),
+                                         Property("enabled", kPropertyTypeBoolean, false)}),
+                           [alarm_display](const PropertyList& properties) -> ReturnValue {
+                               const int index = properties["index"].value<int>();
+                               const bool enabled = properties["enabled"].value<bool>();
+                               if (!alarm_display->alarm().SetEnabled(index, enabled)) {
+                                   return std::string("No alarm at that index.");
+                               }
+                               return std::string(enabled ? "Alarm enabled." : "Alarm disabled.");
+                           });
     }
 
 public:
@@ -1073,42 +1361,23 @@ public:
 
     virtual AudioCodec* GetAudioCodec() override {
         static BoxAudioCodec audio_codec(
-            i2c_bus_, 
-            AUDIO_INPUT_SAMPLE_RATE, 
-            AUDIO_OUTPUT_SAMPLE_RATE,
-            AUDIO_I2S_GPIO_MCLK, 
-            AUDIO_I2S_GPIO_BCLK, 
-            AUDIO_I2S_GPIO_WS, 
-            AUDIO_I2S_GPIO_DOUT, 
-            AUDIO_I2S_GPIO_DIN,
-            AUDIO_CODEC_PA_PIN, 
-            AUDIO_CODEC_ES8311_ADDR, 
-            AUDIO_CODEC_ES7210_ADDR, 
+            i2c_bus_, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE, AUDIO_I2S_GPIO_MCLK,
+            AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN,
+            AUDIO_CODEC_PA_PIN, AUDIO_CODEC_ES8311_ADDR, AUDIO_CODEC_ES7210_ADDR,
             AUDIO_INPUT_REFERENCE);
         return &audio_codec;
     }
 
-    virtual Display* GetDisplay() override {
-        return display_;
-    }
+    virtual Display* GetDisplay() override { return display_; }
 
-    virtual Backlight* GetBacklight() override {
-        return backlight_;
-    }
+    virtual Backlight* GetBacklight() override { return backlight_; }
 
-    virtual bool GetBatteryLevel(int &level, bool &charging, bool &discharging) override {
-        static bool last_discharging = false;
+    virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
         // A full pack on USB sits in standby: the AXP2101 reports neither
         // direction, which used to be indistinguishable from "no battery".
         // Charge-done is the signal that tells the two apart.
         charging = pmic_->IsCharging() || pmic_->IsChargingDone();
         discharging = pmic_->IsDischarging();
-        if (discharging != last_discharging)
-        {
-            power_save_timer_->SetEnabled(discharging);
-            last_discharging = discharging;
-        }
-
         level = pmic_->GetBatteryLevel();
         return true;
     }
